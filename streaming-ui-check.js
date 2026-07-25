@@ -103,18 +103,14 @@ function displayName(name) {
 }
 
 ;(async () => {
-  const values = await Promise.all([
+  testYTB()
+  testParam()
+  const [{ region, status }] = await Promise.all([
     testDisneyPlus(),
     testNf(FILM_ID),
     testChatGPT(),
-    testYTB(),
-    testParam(),
     testReddit()
   ]);
-
-  const disney = values[0] || {};
-  const region = disney.region;
-  const status = disney.status;
 
   if (status === STATUS_COMING && region) {
     result.Disney =
@@ -365,139 +361,109 @@ function timeout(delay = 5000) {
 }
 
 function testNf(filmId) {
-  return new Promise(resolve => {
-    const option = {
+  return new Promise((resolve, reject) =>{
+    let option = {
       url: BASE_URL + filmId,
-      opts,
+      opts: opts,
       timeout: 5200,
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.61 Safari/537.36"
-      }
-    };
-
-    $task.fetch(option).then(
-      response => {
-        console.log("nf:" + response.statusCode);
-        if (response.statusCode === 404) {
-          result.Netflix = "<b>Netflix: </b>支持自制剧集 ⚠️";
-          resolve("Not Found");
-          return;
-        }
-
-        if (response.statusCode === 403) {
-          unsupported("Netflix");
-          resolve("Not Available");
-          return;
-        }
-
-        if (response.statusCode === 200) {
-          try {
-            const headers = response.headers || {};
-            const url =
-              headers["X-Originating-URL"] ||
-              headers["x-originating-url"];
-            let region = url.split("/")[3].split("-")[0];
-            if (region === "title") region = "us";
-            result.Netflix =
-              "<b>Netflix: </b>完整支持" +
-              arrow +
-              "⟦" +
-              flag(region) +
-              "⟧ 🎉";
-          } catch (_) {
-            unsupported("Netflix");
-          }
-          resolve(result.Netflix);
-          return;
-        }
-
-        unsupported("Netflix");
-        resolve("Not Available");
+        'User-Agent':
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.61 Safari/537.36',
       },
-      () => {
-        unsupported("Netflix");
-        resolve("Not Available");
+    }
+    $task.fetch(option).then(response => {
+      console.log("nf:"+response.statusCode)
+      if (response.statusCode === 404) {
+        result["Netflix"] = "<b>Netflix: </b>支持自制剧集 ⚠️"
+        console.log("nf:"+result["Netflix"])
+        resolve('Not Found')
+        return 
+      } else if (response.statusCode === 403) {
+        result["Netflix"] = "<b>Netflix: </b>不支持 🚫"
+        console.log("nf:"+result["Netflix"])
+        resolve('Not Available')
+        return
+      } else if (response.statusCode === 200) {
+        let url = response.headers['X-Originating-URL']
+        let region = url.split('/')[3]
+        region = region.split('-')[0]
+        if (region == 'title') {
+          region = 'us'
+        }
+        console.log("nf:"+region)
+        result["Netflix"] = "<b>Netflix: </b>完整支持"+arrow+ "⟦"+flags.get(region.toUpperCase())+"⟧ 🎉"
+        resolve("nf:"+result["Netflix"])
+        return 
       }
-    );
-  });
+      result["Netflix"] = "<b>Netflix: </b>不支持 🚫"
+      resolve("Netflix Test Error")
+    }, reason => {
+      result["Netflix"] = "<b>Netflix: </b>不支持 🚫"
+      console.log(result["Netflix"])
+      resolve("timeout")
+    }
+    )
+  }
+  )
 }
 
-function testYTB() {
-  return new Promise(resolve => {
-    const option = {
+function testYTB() { 
+    let option = {
       url: BASE_URL_YTB,
-      opts,
+      opts: opts,
       timeout: 2800,
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.61 Safari/537.36"
+        'User-Agent':
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.61 Safari/537.36'
       }
-    };
-
-    $task.fetch(option).then(
-      response => {
-        const data = response.body || "";
-        if (response.statusCode !== 200) {
-          unsupported("YouTube");
-        } else if (
-          data.indexOf("Premium is not available in your country") !== -1
-        ) {
-          unsupported("YouTube");
-        } else {
-          let region = "";
-          const match = /"GL":"(.*?)"/gm.exec(data);
-          if (match && match.length === 2) {
-            region = match[1];
-          } else if (data.indexOf("www.google.cn") !== -1) {
-            region = "CN";
-          } else {
-            region = "US";
-          }
-          result.YouTube =
-            "<b>YouTube Premium: </b>支持 " +
-            arrow +
-            "⟦" +
-            flag(region) +
-            "⟧ 🎉";
-        }
-        resolve(result.YouTube);
-      },
-      () => {
-        unsupported("YouTube");
-        resolve(result.YouTube);
+    }
+    $task.fetch(option).then(response=> {
+      let data = response.body
+      console.log("ytb:"+response.statusCode)
+      if (response.statusCode !== 200) {
+        result["YouTube"] = "<b>YouTube Premium: </b>不支持 🚫"
+      } else if (data.indexOf('Premium is not available in your country') !== -1) {
+        result["YouTube"] = "<b>YouTube Premium: </b>不支持 🚫"
+      } else if (data.indexOf('Premium is not available in your country') == -1) {
+      let region = ''
+      let re = new RegExp('"GL":"(.*?)"', 'gm')
+      let ret = re.exec(data)
+      if (ret != null && ret.length === 2) {
+        region = ret[1]
+      } else if (data.indexOf('www.google.cn') !== -1) {
+        region = 'CN'
+      } else {
+        region = 'US'
       }
-    );
-  });
+      result["YouTube"] = "<b>YouTube Premium: </b>支持 "+arrow+ "⟦"+flags.get(region.toUpperCase())+"⟧ 🎉"
+      console.log("ytb:"+region+ result["YouTube"])
+      }
+    }, reason => {
+      result["YouTube"] = "<b>YouTube Premium: </b>不支持 🚫"
+    })
 }
 
-function testParam() {
-  return new Promise(resolve => {
-    const option = {
+function testParam() { 
+  let option = {
       url: BASE_URL_Param,
       opts: opts1,
       timeout: 2800,
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.61 Safari/537.36"
+        'User-Agent':
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.61 Safari/537.36'
       }
-    };
-
-    $task.fetch(option).then(
-      response => {
-        if (response.statusCode === 200) {
-          result.Paramount = "<b>Paramountᐩ: </b>支持 🎉";
-        } else {
-          unsupported("Paramount");
-        }
-        resolve(result.Paramount);
-      },
-      () => {
-        unsupported("Paramount");
-        resolve(result.Paramount);
-      }
-    );
-  });
+    }
+  $task.fetch(option).then(response=> {
+    console.log("Paramountᐩ:"+response.statusCode)
+    if (response.statusCode == 200) {
+      result["Paramount"] = "<b>Paramountᐩ: </b>支持 🎉 "
+    } else {
+      result["Paramount"] = "<b>Paramountᐩ: </b>不支持 🚫"
+    } 
+      console.log("Paramountᐩ:"+ result["Paramount"])
+  }, reason => {
+    result["Paramount"] = "<b>Paramountᐩ: </b>不支持 🚫"
+  })
 }
 
 function testChatGPT() {
