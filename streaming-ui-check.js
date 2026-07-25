@@ -81,6 +81,11 @@ function flag(region) {
   );
 }
 
+// 保持 KOP-XIAO 原函数的 flags.get(...) 调用方式。
+const flags = {
+  get: region => flag(region)
+};
+
 function unsupported(name) {
   result[name] = `<b>${displayName(name)}: </b>不支持 🚫`;
 }
@@ -188,120 +193,169 @@ function displayName(name) {
 
 async function testDisneyPlus() {
   try {
-    let { region } = await Promise.race([testHomePage(), timeout(7000)]);
-    const { countryCode, inSupportedLocation, accessToken } =
-      await Promise.race([getLocationInfo(), timeout(7000)]);
-
-    region = countryCode ?? region;
-
-    if (
-      inSupportedLocation === false ||
-      inSupportedLocation === "false"
-    ) {
-      return { region, status: STATUS_COMING };
+    let { region, cnbl } = await Promise.race([testHomePage(), timeout(7000)])
+    console.log(`homepage: region=${region}, cnbl=${cnbl}`)
+    // 即将登陆
+//  if (cnbl == 2) {
+//    return { region, status: STATUS_COMING }
+//  }
+    let { countryCode, inSupportedLocation, accessToken } = await Promise.race([getLocationInfo(), timeout(7000)])
+    console.log(`getLocationInfo: countryCode=${countryCode}, inSupportedLocation=${inSupportedLocation}`)
+    
+    region = countryCode ?? region
+    console.log( "region:"+region)
+    // 即将登陆
+    if (inSupportedLocation === false || inSupportedLocation === 'false') {
+      return { region, status: STATUS_COMING }
+    } else {
+      // 支持解锁
+      return { region, status: STATUS_AVAILABLE }
     }
 
-    return { region, status: STATUS_AVAILABLE, accessToken };
+   let support = await Promise.race([testPublicGraphqlAPI(accessToken), timeout(7000)])
+      if (!support) {
+      return { status: STATUS_NOT_AVAILABLE }
+    }
+    // 支持解锁
+    return { region, status: STATUS_AVAILABLE }
+    
   } catch (error) {
-    console.log("Disneyᐩ Error: " + error);
-    if (error === "Not Available") {
-      return { status: STATUS_NOT_AVAILABLE };
+    console.log("error:"+error)
+    
+    // 不支持解锁
+    if (error === 'Not Available') {
+      console.log("不支持")
+      return { status: STATUS_NOT_AVAILABLE }
     }
-    if (error === "Timeout") {
-      return { status: STATUS_TIMEOUT };
+    
+    // 检测超时
+    if (error === 'Timeout') {
+      return { status: STATUS_TIMEOUT }
     }
-    return { status: STATUS_ERROR };
-  }
+    
+    return { status: STATUS_ERROR }
+  } 
+  
 }
 
 function getLocationInfo() {
   return new Promise((resolve, reject) => {
-    const option = {
-      url: "https://disney.api.edge.bamgrid.com/graph/v1/device/graphql",
+    let opts0 = {
+      url: 'https://disney.api.edge.bamgrid.com/graph/v1/device/graphql',
       method: "POST",
-      opts,
+      opts: opts,
       headers: {
-        "Accept-Language": "en",
-        Authorization:
-          "ZGlzbmV5JmJ3dzZXImMS4wLjA.Cu56AgSfBTDag5NiRA81oLHkDZfu5L3CKadnefEAY84",
-        "Content-Type": "application/json",
-        "User-Agent": UA
+        'Accept-Language': 'en',
+        "Authorization": 'ZGlzbmV5JmJ3dzZXImMS4wLjA.Cu56AgSfBTDag5NiRA81oLHkDZfu5L3CKadnefEAY84',
+        'Content-Type': 'application/json',
+        'User-Agent': UA,
       },
       body: JSON.stringify({
-        query:
-          "mutation registerDevice($input: RegisterDeviceInput!) { registerDevice(registerDevice: $input) { grant { grantType assertion } } }",
+        query: 'mutation registerDevice($input: RegisterDeviceInput!) { registerDevice(registerDevice: $input) { grant { grantType assertion } } }',
         variables: {
           input: {
-            applicationRuntime: "chrome",
+            applicationRuntime: 'chrome',
             attributes: {
-              browserName: "chrome",
-              browserVersion: "94.0.4606",
-              manufacturer: "apple",
+              browserName: 'chrome',
+              browserVersion: '94.0.4606',
+              manufacturer: 'apple',
               model: null,
-              operatingSystem: "macintosh",
-              operatingSystemVersion: "10.15.7",
-              osDeviceIds: []
+              operatingSystem: 'macintosh',
+              operatingSystemVersion: '10.15.7',
+              osDeviceIds: [],
             },
-            deviceFamily: "browser",
-            deviceLanguage: "en",
-            deviceProfile: "macosx"
-          }
-        }
+            deviceFamily: 'browser',
+            deviceLanguage: 'en',
+            deviceProfile: 'macosx',
+          },
+        },
       })
-    };
-
-    $task.fetch(option).then(
-      response => {
-        if (response.statusCode !== 200) {
-          reject("Not Available");
-          return;
-        }
-        try {
-          const sdk = JSON.parse(response.body)?.extensions?.sdk;
-          const accessToken = sdk.token.accessToken;
-          const inSupportedLocation = sdk.session.inSupportedLocation;
-          const countryCode = sdk.session.location.countryCode;
-          resolve({ inSupportedLocation, countryCode, accessToken });
-        } catch (_) {
-          reject("Error");
-        }
+    }
+    
+    $task.fetch(opts0).then(response => {
+      let data = response.body
+      console.log("locationinfo:"+response.statusCode)
+      if (response.statusCode !== 200) {
+        console.log('getLocationInfo: ' + data)
+        reject('Not Available')
+        return
+      } else {
+        let {
+          token: { accessToken },
+          session: {
+            inSupportedLocation,
+            location: { countryCode },
       },
-      () => reject("Error")
-    );
-  });
+      } = JSON.parse(data)?.extensions?.sdk
+        resolve({ inSupportedLocation, countryCode, accessToken })
+      }
+    }, reason => {
+      reject('Error')
+      return
+    })
+  })
 }
 
 function testHomePage() {
   return new Promise((resolve, reject) => {
-    const option = {
-      url: "https://www.disneyplus.com/",
-      opts,
+    let opts0 = {
+      url: 'https://www.disneyplus.com/',
+      opts: opts,
       headers: {
-        "Accept-Language": "en",
-        "User-Agent": UA
-      }
-    };
-
-    $task.fetch(option).then(
-      response => {
-        const data = response.body || "";
-        if (
-          response.statusCode !== 200 ||
-          data.indexOf("not available in your region") !== -1
-        ) {
-          reject("Not Available");
-          return;
-        }
-        const match = data.match(/Region: ([A-Za-z]{2})[\s\S]*?CNBL: ([12])/);
-        resolve(
-          match
-            ? { region: match[1], cnbl: match[2] }
-            : { region: "", cnbl: "" }
-        );
+        'Accept-Language': 'en',
+        'User-Agent': UA,
       },
-      () => reject("Error")
-    );
-  });
+    }
+    $task.fetch(opts0).then(response => {
+      let data = response.body
+      console.log("DisneyPlus: homepage"+response.statusCode)
+      if (response.statusCode !== 200 || data.indexOf('not available in your region') !== -1) {
+        reject('Not Available')
+        return
+      } else {
+        let match = data.match(/Region: ([A-Za-z]{2})[\s\S]*?CNBL: ([12])/)
+        if (!match) {
+          resolve({ region: '', cnbl: '' })
+          return;
+        } else {
+          let region = match[1]
+          let cnbl = match[2]
+          //console.log("homepage"+region+cnbl)
+          resolve({ region, cnbl })
+        }
+      }
+    }, reason => {
+      reject('Error')
+      return
+    })
+  })
+}
+
+function testPublicGraphqlAPI(accessToken) {
+  return new Promise((resolve, reject) => {
+    let opts = {
+      url: 'https://disney.api.edge.bamgrid.com/v1/public/graphql',
+      headers: {
+        'Accept-Language': 'en',
+        Authorization: accessToken,
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.71 Safari/537.36',
+      },
+      body: JSON.stringify({
+        query:
+          'query($preferredLanguages: [String!]!, $version: String) {globalization(version: $version) { uiLanguage(preferredLanguages: $preferredLanguages) }}',
+        variables: { version: '1.5.0', preferredLanguages: ['en'] },
+      }),
+    }
+
+    $task.fetch(opts).then( response => {
+
+      resolve(response.status === 200)
+    }, reason => {
+        reject('Error')
+        return
+    })
+  })
 }
 
 function timeout(delay = 5000) {
@@ -447,62 +501,51 @@ function testParam() {
 }
 
 function testChatGPT() {
-  return new Promise(resolve => {
-    const option = {
+  return new Promise((resolve, reject) =>{
+    let option = {
       url: BASE_URL_GPT,
       opts: opts1,
-      timeout: 2800
-    };
-
-    $task.fetch(option).then(
-      response => {
-        const responseText = JSON.stringify(response);
-        if (responseText.indexOf("text/plain") !== -1) {
-          unsupported("ChatGPT");
-          resolve(result.ChatGPT);
-          return;
-        }
-
-        const regionOption = {
-          url: Region_URL_GPT,
-          opts: opts1,
-          timeout: 2800
-        };
-
-        $task.fetch(regionOption).then(
-          regionResponse => {
-            try {
-              const region = regionResponse.body
-                .split("loc=")[1]
-                .split("\n")[0];
-              if (support_countryCodes.indexOf(region) !== -1) {
-                result.ChatGPT =
-                  "<b>ChatGPT: </b>支持 " +
-                  arrow +
-                  "⟦" +
-                  flag(region) +
-                  "⟧ 🎉";
-              } else {
-                unsupported("ChatGPT");
-              }
-            } catch (_) {
-              unsupported("ChatGPT");
-            }
-            resolve(result.ChatGPT);
-          },
-          () => {
-            unsupported("ChatGPT");
-            resolve(result.ChatGPT);
-          }
-        );
-      },
-      () => {
-        unsupported("ChatGPT");
-        resolve(result.ChatGPT);
+      timeout: 2800,
+    }
+    $task.fetch(option).then(response=> {
+      let resp = JSON.stringify(response)
+      console.log("ChatGPT Main Test")
+      let jdg = resp.indexOf("text/plain")
+      if(jdg == -1) {
+      let option1 = {
+        url: Region_URL_GPT,
+        opts: opts1,
+        timeout: 2800,
       }
-    );
-  });
-}
+      $task.fetch(option1).then(response=> {
+        console.log("ChatGPT Region Test")
+        let region = response.body.split("loc=")[1].split("\n")[0]
+        console.log("ChatGPT Region: "+region)
+        let res = support_countryCodes.indexOf(region)
+        if (res != -1) {
+          result["ChatGPT"] = "<b>ChatGPT: </b>支持 "+arrow+ "⟦"+flags.get(region.toUpperCase())+"⟧ 🎉"
+          console.log("支持 ChatGPT")
+          resolve("支持 ChatGPT")
+          return
+        } else {
+          result["ChatGPT"] = "<b>ChatGPT: </b>不支持 🚫"
+          console.log("不支持 ChatGPT")
+          resolve("不支持 ChatGPT")
+          return
+        }
+      }, reason => {
+        console.log("Check-Error"+reason)
+        resolve("ChatGPT failed")
+      })
+    } else {
+      result["ChatGPT"] = "<b>ChatGPT: </b>不支持 🚫"
+      console.log("不支持 ChatGPT")
+      resolve("不支持 ChatGPT")
+    }
+    }, reason => {
+      console.log("ChatGPT-Error"+reason)
+      resolve("ChatGPT failed")
+    })})}
 
 function testReddit() {
   return new Promise(resolve => {
