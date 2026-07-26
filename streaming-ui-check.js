@@ -15,6 +15,8 @@ For Quantumult-X 598+ ONLY!!
 2026-07-26
 
 - 移除 Dazn / Discoveryᐩ 检测，新增 Reddit 检测（参考 check.unlock.media：200 支持 / 403 不支持）
+- 新增 HBO Max 检测（参考 check.unlock.media：落地国家在支持地区列表内则支持）
+- 各项检测失败/超时提示统一为「失败 ❗️」
 
 [task_local]
 
@@ -30,6 +32,7 @@ const BASE_URL_DISNEY = 'https://www.disneyplus.com';
 const BASE_URL_Param = "https://www.paramountplus.com/"
 const FILM_ID = 81280792
 const BASE_URL_Reddit = "https://www.reddit.com/"
+const BASE_URL_HBOMax = "https://www.max.com/"
 const BASE_URL_GPT = 'https://chat.openai.com/'
 const Region_URL_GPT = 'https://chat.openai.com/cdn-cgi/trace'
 
@@ -65,12 +68,13 @@ var flags = new Map([[ "AC" , "🇦🇨" ] ,["AE","🇦🇪"], [ "AF" , "🇦�
 
 let result = {
   "title": '    📺  流媒体服务查询',
-  "YouTube": '<b>YouTube: </b>检测失败，请重试 ❗️',
-  "Netflix": '<b>Netflix: </b>检测失败，请重试 ❗️',
-  "Disney": "<b>Disneyᐩ: </b>检测失败，请重试 ❗️",
-  "Paramount" : "<b>Paramountᐩ: </b>检测失败，请重试 ❗️",
-  "Reddit" : "<b>Reddit: </b>检测失败，请重试 ❗️",
-  "ChatGPT" : "<b>ChatGPT: </b>检测失败，请重试 ❗️"
+  "YouTube": '<b>YouTube: </b>失败 ❗️',
+  "Netflix": '<b>Netflix: </b>失败 ❗️',
+  "Disney": "<b>Disneyᐩ: </b>失败 ❗️",
+  "Paramount" : "<b>Paramountᐩ: </b>失败 ❗️",
+  "HBOMax" : "<b>HBO Max: </b>失败 ❗️",
+  "Reddit" : "<b>Reddit: </b>失败 ❗️",
+  "ChatGPT" : "<b>ChatGPT: </b>失败 ❗️"
   //"Google": "Google 定位: 检测失败，请重试"
 
 }
@@ -82,7 +86,7 @@ const message = {
 ;(async () => {
   testYTB()
   testParam()
-  let [{ region, status }] = await Promise.all([testDisneyPlus(),testNf(FILM_ID),testReddit(),testChatGPT()])
+  let [{ region, status }] = await Promise.all([testDisneyPlus(),testNf(FILM_ID),testReddit(),testHBOMax(),testChatGPT()])
   console.log("NetFlix Result:"+result["Netflix"])
   console.log(`testDisneyPlus: region=${region}, status=${status}`)
   if (status==STATUS_COMING) {
@@ -96,10 +100,10 @@ const message = {
     //console.log(3)
     result["Disney"] = "<b>Disneyᐩ:</b> 未支持 🚫 "
   } else if (status==STATUS_TIMEOUT) {
-    result["Disney"] = "<b>Disneyᐩ:</b> 检测超时 🚦 "
+    result["Disney"] = "<b>Disneyᐩ:</b> 失败 ❗️"
   }
 
-  let content = "------------------------------"+"</br>"+([result["YouTube"],result["Netflix"],result["Disney"],result["Paramount"],result["Reddit"],result["ChatGPT"]]).join("</br></br>")
+  let content = "------------------------------"+"</br>"+([result["YouTube"],result["Netflix"],result["Disney"],result["Paramount"],result["HBOMax"],result["Reddit"],result["ChatGPT"]]).join("</br></br>")
   content = content + "</br>------------------------------</br>"+"<font color=#CD5C5C >"+"<b>节点</b> ➟ " + $environment.params+ "</font>"
   content =`<p style="text-align: center; font-family: -apple-system; font-size: large; font-weight: thin">` + content + `</p>`
 //  cnt = `<p style="text-align: center; font-family: -apple-system; font-size: large; font-weight: thin">` +'----------------------</br></br>'+result["Disney"]+'</br></br>----------------------</br>'+$environment.params + `</p>`
@@ -110,7 +114,7 @@ $configuration.sendMessage(message).then(resolve => {
     }
     if (resolve.ret) {
       let output=JSON.stringify(resolve.ret[message.content])? JSON.stringify(resolve.ret[message.content]).replace(/\"|\[|\]/g,"").replace(/\,/g," ➟ ") : $environment.params
-      let content = "--------------------------------------</br>"+([result["Reddit"],result["Paramount"],result["Disney"],result["ChatGPT"],result["Netflix"],result["YouTube"]]).join("</br></br>")
+      let content = "--------------------------------------</br>"+([result["Reddit"],result["HBOMax"],result["Paramount"],result["Disney"],result["ChatGPT"],result["Netflix"],result["YouTube"]]).join("</br></br>")
       content = content + "</br>--------------------------------------</br>"+"<font color=#CD5C5C>"+"<b>节点</b> ➟ " + output+ "</font>"
       content =`<p style="text-align: center; font-family: -apple-system; font-size: large; font-weight: thin">` + content + `</p>`
       //$notify(typeof(output),output)
@@ -134,7 +138,7 @@ $configuration.sendMessage(message).then(resolve => {
     }
     if (resolve.ret) {
       let output=JSON.stringify(resolve.ret[message.content])? JSON.stringify(resolve.ret[message.content]).replace(/\"|\[|\]/g,"").replace(/\,/g," ➟ ") : $environment.params
-      let content = "--------------------------------------</br>"+([result["Reddit"],result["Paramount"],result["Disney"],result["ChatGPT"],result["Netflix"],result["YouTube"]]).join("</br></br>")
+      let content = "--------------------------------------</br>"+([result["Reddit"],result["HBOMax"],result["Paramount"],result["Disney"],result["ChatGPT"],result["Netflix"],result["YouTube"]]).join("</br></br>")
       content = content + "</br>--------------------------------------</br>"+"<font color=#CD5C5C>"+"<b>节点</b> ➟ " + output+ "</font>"
       content =`<p style="text-align: center; font-family: -apple-system; font-size: large; font-weight: thin">` + content + `</p>`
       //$notify(typeof(output),output)
@@ -372,7 +376,7 @@ function testNf(filmId) {
       }
       resolve("Netflix Test Error")
     }, reason => {
-      result["Netflix"] = "<b>Netflix: </b>检测超时 🚦"
+      result["Netflix"] = "<b>Netflix: </b>失败 ❗️"
       console.log(result["Netflix"])
       resolve("timeout")
     }
@@ -396,7 +400,7 @@ function testYTB() {
       console.log("ytb:"+response.statusCode)
       if (response.statusCode !== 200) {
         //reject('Error')
-        result["YouTube"] = "<b>YouTube Premium: </b>检测失败 ❗️"
+        result["YouTube"] = "<b>YouTube Premium: </b>失败 ❗️"
       } else if (data.indexOf('Premium is not available in your country') !== -1) {
           //resolve('Not Available')
         result["YouTube"] = "<b>YouTube Premium: </b>未支持 🚫"
@@ -416,7 +420,7 @@ function testYTB() {
       console.log("ytb:"+region+ result["YouTube"])
       }
     }, reason => {
-      result["YouTube"] = "<b>YouTube Premium: </b>检测超时 🚦"
+      result["YouTube"] = "<b>YouTube Premium: </b>失败 ❗️"
       //resolve("timeout")
     })
 }
@@ -443,7 +447,7 @@ function testParam() {
     } 
       console.log("Paramountᐩ:"+ result["Paramount"])
   }, reason => {
-    result["Paramount"] = "<b>Paramountᐩ: </b>检测超时 🚦"
+    result["Paramount"] = "<b>Paramountᐩ: </b>失败 ❗️"
     //resolve("timeout")
   })
 }
@@ -474,15 +478,86 @@ function testReddit() {
         resolve("不支持 Reddit")
         return
       } else {
-        result["Reddit"] = "<b>Reddit: </b>检测失败 ❗️"
+        result["Reddit"] = "<b>Reddit: </b>失败 ❗️"
         console.log("Reddit 检测失败:"+response.statusCode)
         resolve("Reddit failed")
         return
       }
     }, reason => {
-      result["Reddit"] = "<b>Reddit: </b>检测超时 🚦"
+      result["Reddit"] = "<b>Reddit: </b>失败 ❗️"
       console.log("Reddit-Error"+reason)
       resolve("Reddit timeout")
+    })})}
+
+
+// HBO Max test (参考 check.unlock.media: 落地国家在支持地区列表内 => 支持)
+// 播放级代理检测需要登录账号的令牌, 公开脚本无法实现, 故与 check.unlock.media 保持同级检测
+
+function testHBOMax() {
+  return new Promise((resolve, reject) =>{
+    let option = {
+      url: BASE_URL_HBOMax,
+      opts: opts,
+      timeout: 5000,
+      headers: {
+        'User-Agent': UA,
+      },
+    }
+    $task.fetch(option).then(response=> {
+      let data = response.body
+      console.log("HBOMax:"+response.statusCode)
+      if (response.statusCode == 403) {
+        result["HBOMax"] = "<b>HBO Max: </b>未支持 🚫"
+        console.log("不支持 HBO Max (IP被拦截)")
+        resolve("不支持 HBOMax")
+        return
+      }
+      if (response.statusCode != 200) {
+        result["HBOMax"] = "<b>HBO Max: </b>失败 ❗️"
+        console.log("HBOMax 失败:"+response.statusCode)
+        resolve("HBOMax failed")
+        return
+      }
+      // 首选: 页面自带的地区判定字段 userCountry / isUserOutOfRegion
+      let outMatch = data.match(/"isUserOutOfRegion":(true|false)/)
+      let ctyMatch = data.match(/"userCountry":"([A-Za-z]{2})"/)
+      if (outMatch && ctyMatch) {
+        let region = ctyMatch[1].toUpperCase()
+        console.log("HBOMax:"+region+" outOfRegion:"+outMatch[1])
+        if (outMatch[1] == "false") {
+          result["HBOMax"] = "<b>HBO Max: </b>支持 "+arrow+"⟦"+(flags.get(region) || region)+"⟧ 🎉"
+          resolve("支持 HBOMax")
+        } else {
+          result["HBOMax"] = "<b>HBO Max: </b>未支持 🚫"
+          resolve("不支持 HBOMax")
+        }
+        return
+      }
+      // 兜底: check.unlock.media 同款 — countryCode 与页面支持地区列表比对
+      let headers = JSON.stringify(response.headers)
+      let regionMatch = (headers + data).match(/countryCode=([A-Z]{2})/)
+      let list = [], re = /"url":"\/([a-z]{2})\/[a-z]{2}"/g, m
+      while ((m = re.exec(data)) !== null) { list.push(m[1].toUpperCase()) }
+      list.push("US")
+      if (regionMatch) {
+        let region = regionMatch[1]
+        console.log("HBOMax fallback:"+region)
+        if (list.indexOf(region) != -1) {
+          result["HBOMax"] = "<b>HBO Max: </b>支持 "+arrow+"⟦"+(flags.get(region) || region)+"⟧ 🎉"
+          resolve("支持 HBOMax")
+        } else {
+          result["HBOMax"] = "<b>HBO Max: </b>未支持 🚫"
+          resolve("不支持 HBOMax")
+        }
+        return
+      }
+      result["HBOMax"] = "<b>HBO Max: </b>失败 ❗️"
+      console.log("HBOMax 未取到地区信息")
+      resolve("HBOMax no region")
+    }, reason => {
+      result["HBOMax"] = "<b>HBO Max: </b>失败 ❗️"
+      console.log("HBOMax-Error"+reason)
+      resolve("HBOMax timeout")
     })})}
 
 
