@@ -10,6 +10,8 @@
 #   - Dynamic TCP/UDP buffer ceilings from bandwidth, user-provided RTT and RAM.
 #   - High file-descriptor limits for systemd and detected proxy service units.
 #   - Hysteria port-hopping protection through ip_local_reserved_ports.
+#   - Primary-protocol aware profiles: ss2022 / anytls / hysteria / vless-cdn.
+#   - Optional initcwnd/initrwnd raise with systemd persistence and rollback.
 #   - Optional, separately confirmed XanMod LTS/BBRv3 kernel installation.
 #   - Separately confirmed, digest-verified Debian Cloud BBRv3 fallback.
 #   - Dedicated config files, backups, runtime validation and rollback.
@@ -20,7 +22,7 @@
 set -u
 set -o pipefail
 
-readonly SCRIPT_VERSION="1.3.1"
+readonly SCRIPT_VERSION="1.4.0"
 readonly PROGRAM_NAME="proxy-net-tune"
 readonly SYSCTL_CONF="/etc/sysctl.d/99-zz-proxy-net-tune.conf"
 readonly LIMITS_CONF="/etc/security/limits.d/99-zz-proxy-net-tune.conf"
@@ -37,6 +39,7 @@ readonly XANMOD_REPO_FILE="/etc/apt/sources.list.d/xanmod-release.list"
 readonly CLOUD_KERNEL_API="https://api.github.com/repos/CloudPassenger/Cloud-Kernel-BBRv3"
 readonly CLOUD_KERNEL_REPO="https://github.com/CloudPassenger/Cloud-Kernel-BBRv3"
 readonly PROXY_DROPIN_NAME="99-zz-proxy-net-tune-nofile.conf"
+readonly INITCWND_UNIT="/etc/systemd/system/proxy-net-tune-initcwnd.service"
 
 ACTION="apply"
 DRY_RUN=0
@@ -46,6 +49,11 @@ SERVER_MBPS=""
 IP_MODE=""
 RTT_INPUT=""
 HYSTERIA_RANGE_INPUT="auto"
+PROTOCOL_INPUT=""
+PROTOCOL="general"
+PROTOCOL_LABEL="通用（未指定主力协议）"
+INITCWND_INPUT=""
+INITCWND=0
 APPLYING=0
 ACTIVE_BACKUP=""
 
@@ -69,6 +77,9 @@ NETDEV_BACKLOG=4096
 SOMAXCONN=4096
 SYN_BACKLOG=8192
 NOTSENT_LOWAT=131072
+KEEPALIVE_TIME=1200
+KEEPALIVE_INTVL=30
+KEEPALIVE_PROBES=5
 NOFILE_LIMIT=1048576
 SELECTED_CC="cubic"
 SELECTED_QDISC="fq"
@@ -94,6 +105,7 @@ declare -a SYSCTL_KEYS=()
 declare -a SYSCTL_VALUES=()
 declare -a SYSCTL_NOTES=()
 declare -a SKIPPED_SETTINGS=()
+declare -a PROFILE_NOTES=()
 declare -a PROXY_UNITS=()
 declare -a PROXY_DROPIN_UNITS=()
 declare -a PROXY_DROPIN_PATHS=()
@@ -135,7 +147,9 @@ usage() {
   --local-mbps N     本地宽带，默认 1000 Mbps
   --server-mbps N    VPS 标称带宽，默认 1000 Mbps
   --ip-mode MODE     4、6 或 dual，默认 dual
-  --rtt-ms N         本机到 VPS 的真实往返延迟（毫秒）
+  --rtt-ms N         本机到 VPS 的真实往返延迟（毫秒）；CDN 模式填 VPS 到边缘的 RTT
+  --protocol P       sing-box 主力协议: ss2022、anytls、hysteria、vless-cdn 或 general
+  --initcwnd N       提升默认路由 initcwnd/initrwnd；0 关闭，或 10-64（建议仅 TCP 协议）
   --hysteria-range R Hysteria 端口跳跃范围；auto、none 或如 50000:51000
   --dry-run          只生成并显示配置，不修改系统
   --yes              跳过网络配置确认（不会跳过 BBRv3 内核确认）
@@ -147,7 +161,8 @@ usage() {
 示例:
   bash proxy-net-tune.sh
   bash proxy-net-tune.sh --dry-run --server-mbps 1000 --rtt-ms 100 --ip-mode dual
-  bash proxy-net-tune.sh --hysteria-range 50000:51000
+  bash proxy-net-tune.sh --protocol ss2022 --initcwnd 25
+  bash proxy-net-tune.sh --protocol hysteria --hysteria-range 50000:51000
   bash proxy-net-tune.sh --restore
 EOF
 }
@@ -431,6 +446,7 @@ configure_hysteria_port_hopping() {
     HYSTERIA_RESERVED_PORTS=""
     HYSTERIA_RANGE_SOURCE="未检测到"
     detect_hysteria_presence && HYSTERIA_DETECTED=1
+    [[ $PROTOCOL == "hysteria" ]] && HYSTERIA_DETECTED=1
 
     case ${HYSTERIA_RANGE_INPUT,,} in
         none | off | no)
@@ -535,6 +551,137 @@ confirm_apply() {
     [[ $answer == "YES" ]]
 }
 
+normalize_protocol() {
+    local raw=${1,,}
+    case $raw in
+        1 | ss | ss2022 | shadowsocks | shadowsocks2022 | shadowsocks-2022) PROTOCOL="ss2022" ;;
+        2 | anytls | any-tls) PROTOCOL="anytls" ;;
+        3 | hy | hy2 | hysteria | hysteria2) PROTOCOL="hysteria" ;;
+        4 | vless | vless-cdn | vless-ws | vless-ws-cdn | cdn | ws) PROTOCOL="vless-cdn" ;;
+        0 | general | auto | none) PROTOCOL="general" ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+prompt_protocol() {
+    local answer
+    while true; do
+        cat >&2 <<'EOF'
+
+sing-box 当前主力代理协议（决定针对性优化方向）:
+  1) Shadowsocks 2022        TCP 直连；Quantumult X 原生支持
+  2) AnyTLS                  TCP+TLS 多路复用；Quantumult X v1.6.0+ 支持
+  3) Hysteria2               UDP/QUIC；QX 不支持，供 sing-box 等客户端使用
+  4) VLESS+WS+TLS + CF CDN   TCP，经 Cloudflare 回源；QX 支持
+  0) 通用模式                不针对特定协议，保持旧版行为
+EOF
+        read -r -p "请选择 [1]: " answer
+        answer=$(normalize_user_input "$answer")
+        normalize_protocol "${answer:-1}" && return 0
+        warn "请选择 0-4，或直接输入协议名（如 ss2022、hysteria）。"
+    done
+}
+
+select_protocol() {
+    if [[ -n $PROTOCOL_INPUT ]]; then
+        normalize_protocol "$PROTOCOL_INPUT" \
+            || die "--protocol 无效；可用 ss2022、anytls、hysteria、vless-cdn 或 general"
+    elif [[ -t 0 ]]; then
+        prompt_protocol
+    else
+        PROTOCOL="general"
+        warn "非交互模式未提供 --protocol，按通用模式优化（不做协议针对性调整）。"
+    fi
+}
+
+# Numeric deltas derived from the chosen primary protocol. Pure computation:
+# must stay free of sysctl reads so --self-test can exercise it.
+apply_protocol_profile() {
+    PROFILE_NOTES=()
+    KEEPALIVE_TIME=1200
+    KEEPALIVE_INTVL=30
+    KEEPALIVE_PROBES=5
+    case $PROTOCOL in
+        ss2022)
+            PROTOCOL_LABEL="Shadowsocks 2022（TCP 直连）"
+            PROFILE_NOTES+=("TCP 直连：缓冲区按你本机到 VPS 的端到端 RTT 计算；TFO 已开启，QX 节点可加 fast-open=true 试用。")
+            ;;
+        anytls)
+            PROTOCOL_LABEL="AnyTLS（TCP+TLS 多路复用）"
+            PROFILE_NOTES+=("AnyTLS 复用一条 TCP 承载多路请求：空闲不降窗与 notsent_lowat 限制发送积压对它最关键，均已配置。")
+            ;;
+        hysteria)
+            PROTOCOL_LABEL="Hysteria2（UDP/QUIC）"
+            if ((BUFFER_MIB < 16)); then
+                BUFFER_MIB=16
+                BUFFER_BYTES=$((BUFFER_MIB * MIB))
+                PROFILE_NOTES+=("UDP 收发缓冲上限按 Hysteria 官方建议抬到 16 MiB 下限。")
+            fi
+            PROFILE_NOTES+=("Hysteria 速率由自带 Brutal 拥塞控制决定：请把服务端/客户端配置中的 up/down 带宽填真实值；内核 BBR 不影响 QUIC。")
+            ;;
+        vless-cdn)
+            PROTOCOL_LABEL="VLESS+WS+TLS（Cloudflare CDN 回源）"
+            SOMAXCONN=$(clamp $((SOMAXCONN * 2)) 4096 16384)
+            SYN_BACKLOG=$((SOMAXCONN * 2))
+            ((SYN_BACKLOG > 65536)) && SYN_BACKLOG=65536
+            KEEPALIVE_TIME=600
+            KEEPALIVE_PROBES=3
+            PROFILE_NOTES+=("CDN 从多个边缘 IP 并发回源：accept/SYN 队列已加倍，TCP 保活缩短到 600s 以及时清理边缘侧断掉的连接。")
+            ;;
+        *)
+            PROTOCOL_LABEL="通用（未指定主力协议）"
+            ;;
+    esac
+}
+
+configure_initcwnd() {
+    INITCWND=0
+    local answer
+    if [[ -n $INITCWND_INPUT ]]; then
+        if [[ $INITCWND_INPUT == 0 ]]; then
+            return 0
+        fi
+        is_uint "$INITCWND_INPUT" && ((INITCWND_INPUT >= 10 && INITCWND_INPUT <= 64)) \
+            || die "--initcwnd 必须是 0（关闭）或 10-64"
+        INITCWND=$INITCWND_INPUT
+        [[ $PROTOCOL == "hysteria" ]] \
+            && warn "主力协议是 Hysteria/QUIC，initcwnd 只影响顺带的 TCP 流量。"
+        return 0
+    fi
+    case $PROTOCOL in ss2022 | anytls | vless-cdn) ;; *) return 0 ;; esac
+    [[ -t 0 ]] || return 0
+    if [[ -e $INITCWND_UNIT ]]; then
+        info "已存在 initcwnd 持久化服务；回车可沿用新值覆盖，输入 0 则保持现状。"
+    fi
+    printf '\n提升初始拥塞窗口 initcwnd/initrwnd：新 TCP 连接前几个往返即可全速发包，网页首开与短请求更快。\n' >&2
+    printf '轻微代价是突发发包更陡；脚本会写入 systemd 服务保证重启后仍生效，--restore 可完整撤销。\n' >&2
+    while true; do
+        read -r -p "initcwnd 取值（回车=25 推荐；0=跳过；可输 10-64）: " answer
+        answer=$(normalize_user_input "$answer")
+        answer=${answer:-25}
+        if [[ $answer == 0 ]]; then
+            return 0
+        fi
+        if is_uint "$answer" && ((answer >= 10 && answer <= 64)); then
+            INITCWND=$answer
+            return 0
+        fi
+        warn "请输入 0 或 10-64 的整数。"
+    done
+}
+
+# Print the single default route of one family, normalized. Fails when the
+# route is absent or multipath (multiple lines) — those are never touched.
+current_default_route() {
+    local family=$1 listing count
+    listing=$(ip "-$family" route show default 2>/dev/null || true)
+    count=$(grep -c . <<<"$listing" || true)
+    [[ $count == 1 ]] || return 1
+    head -n1 <<<"$listing" | sed -E \
+        's/[[:space:]]+/ /g; s/^ //; s/ $//; s/ (initcwnd|initrwnd) [0-9]+//g; s/ expires [0-9]+sec//g; s/ linkdown//g'
+}
+
 parse_args() {
     while (($#)); do
         case $1 in
@@ -556,6 +703,16 @@ parse_args() {
             --rtt-ms)
                 (($# >= 2)) || die "--rtt-ms 缺少数值"
                 RTT_INPUT=$2
+                shift 2
+                ;;
+            --protocol)
+                (($# >= 2)) || die "--protocol 缺少协议名"
+                PROTOCOL_INPUT=$2
+                shift 2
+                ;;
+            --initcwnd)
+                (($# >= 2)) || die "--initcwnd 缺少数值"
+                INITCWND_INPUT=$2
                 shift 2
                 ;;
             --hysteria-range)
@@ -640,20 +797,30 @@ detect_primary_iface() {
 }
 
 set_rtt_input() {
+    local rtt_label="本机到 VPS 的真实往返延迟 RTT（ms）"
+    RTT_SOURCE="用户提供的本机实测值"
+    if [[ $PROTOCOL == "vless-cdn" ]]; then
+        rtt_label="VPS 到 Cloudflare 回源边缘的 RTT（ms）"
+        RTT_SOURCE="用户提供的 VPS 到 CF 边缘实测值"
+    fi
     if [[ -z $RTT_INPUT ]]; then
         if [[ -t 0 ]]; then
-            printf '\n请在本机 ping 这台 VPS，填写 avg/平均延迟。\n' >&2
-            printf 'ping 显示的 time/avg 本身就是往返 RTT，不要再乘 2；例如 ping avg=80 ms 就输入 80。\n' >&2
-            RTT_INPUT=$(prompt_required_uint "本机到 VPS 的真实往返延迟 RTT（ms）" 1 1000) \
+            if [[ $PROTOCOL == "vless-cdn" ]]; then
+                printf '\nCDN 回源模式：TCP 在 Cloudflare 边缘就终结了，VPS 只看得到 VPS<->CF 这一段。\n' >&2
+                printf '请在 VPS 上执行 ping www.cloudflare.com，填写 avg 平均值（通常 1-80 ms）。\n' >&2
+            else
+                printf '\n请在本机 ping 这台 VPS，填写 avg/平均延迟。\n' >&2
+                printf 'ping 显示的 time/avg 本身就是往返 RTT，不要再乘 2；例如 ping avg=80 ms 就输入 80。\n' >&2
+            fi
+            RTT_INPUT=$(prompt_required_uint "$rtt_label" 1 1000) \
                 || die "未读取到 RTT，已取消。"
         else
-            die "非交互运行必须提供 --rtt-ms N（本机到 VPS 的真实往返延迟）"
+            die "非交互运行必须提供 --rtt-ms N（$rtt_label）"
         fi
     fi
     is_uint "$RTT_INPUT" && ((RTT_INPUT >= 1 && RTT_INPUT <= 1000)) \
         || die "RTT 必须是 1-1000 ms 的整数"
     RTT_MS=$RTT_INPUT
-    RTT_SOURCE="用户提供的本机实测值"
 }
 
 calculate_tuning() {
@@ -865,6 +1032,12 @@ build_kernel_advice() {
         return 0
     fi
 
+    if [[ $PROTOCOL == "hysteria" ]]; then
+        KERNEL_ADVICE="主力协议是 Hysteria/QUIC，速率由应用层 Brutal 拥塞控制决定，不建议为 BBRv3 更换内核。"
+        KERNEL_ADVICE_DETAIL="内核 BBR 只影响顺带的 TCP 流量；保证 UDP 缓冲充足即可。"
+        return 0
+    fi
+
     if ((high_bdp_path == 1)); then
         RECOMMEND_BBRV3=1
         KERNEL_ADVICE="推荐 XanMod LTS/BBRv3（${XANMOD_PACKAGE}）。"
@@ -927,6 +1100,12 @@ prepare_settings() {
     add_setting net.core.netdev_max_backlog "$NETDEV_BACKLOG" "虚拟网卡突发队列"
     add_setting net.core.somaxconn "$SOMAXCONN" "监听 accept 队列上限"
 
+    local current_optmem
+    current_optmem=$(get_sysctl net.core.optmem_max)
+    if [[ -z $current_optmem ]] || ! decimal_ge "$current_optmem" 81920; then
+        add_setting net.core.optmem_max 81920 "套接字辅助缓冲区，QUIC GSO 等控制消息需要（只增不减）"
+    fi
+
     add_setting net.ipv4.tcp_congestion_control "$SELECTED_CC" "TCP 拥塞控制"
     add_setting net.ipv4.tcp_ecn 1 "主动协商 ECN；BBRv3 可利用拥塞标记减少丢包"
     add_setting net.ipv4.tcp_ecn_fallback 1 "ECN 路径异常时自动回退，兼顾公网兼容性"
@@ -943,6 +1122,12 @@ prepare_settings() {
     add_setting net.ipv4.tcp_timestamps 1 "RTT 测量和 PAWS"
     add_setting net.ipv4.tcp_sack 1 "选择确认以改善丢包恢复"
     add_setting net.ipv4.tcp_syncookies 1 "SYN 队列溢出保护"
+    add_setting net.ipv4.tcp_tw_reuse 1 "允许出站复用 TIME-WAIT 端口，缓解代理出站高并发时的端口紧张"
+    add_setting net.ipv4.tcp_fin_timeout 25 "缩短 FIN_WAIT_2 停留时间，加快连接回收"
+    add_setting net.ipv4.tcp_no_metrics_save 1 "不缓存上次连接的拥塞记录，避免偶发丢包拖累后续连接起步"
+    add_setting net.ipv4.tcp_keepalive_time "$KEEPALIVE_TIME" "空闲多久后开始 TCP 保活探测"
+    add_setting net.ipv4.tcp_keepalive_intvl "$KEEPALIVE_INTVL" "保活探测间隔"
+    add_setting net.ipv4.tcp_keepalive_probes "$KEEPALIVE_PROBES" "保活探测次数，超过即判定连接失效"
     add_setting net.ipv4.ip_local_port_range "10240 65535" "扩大代理出站临时端口范围"
     if [[ -n $HYSTERIA_RESERVED_PORTS ]]; then
         existing_reserved=$(get_sysctl net.ipv4.ip_local_reserved_ports)
@@ -957,6 +1142,32 @@ prepare_settings() {
     # lets quic-go request a larger SO_RCVBUF/SO_SNDBUF when needed.
     add_setting net.ipv4.udp_rmem_min 16384 "UDP/QUIC 最小接收缓冲区"
     add_setting net.ipv4.udp_wmem_min 16384 "UDP/QUIC 最小发送缓冲区"
+
+    if [[ $PROTOCOL == "hysteria" ]]; then
+        local udp_pages udp_min_pages udp_pressure_pages current_udp_mem current_udp_max
+        local conntrack_max current_conntrack
+        udp_pages=$(clamp $((MEM_MB * 64)) 24576 262144)
+        udp_min_pages=$((udp_pages / 2))
+        udp_pressure_pages=$((udp_pages * 3 / 4))
+        current_udp_mem=$(get_sysctl net.ipv4.udp_mem)
+        current_udp_max=${current_udp_mem##* }
+        if ! is_uint "$current_udp_max" || ! decimal_ge "$current_udp_max" "$udp_pages"; then
+            add_setting net.ipv4.udp_mem "$udp_min_pages $udp_pressure_pages $udp_pages" \
+                "UDP 全局内存页上限，防止 Hysteria 大流量时整体丢包（只增不减）"
+        fi
+        add_setting net.core.netdev_budget 600 "软中断每轮多处理一些 UDP 包"
+        add_setting net.core.netdev_budget_usecs 4000 "软中断单轮时间预算"
+
+        # Port hopping is usually implemented with nft/iptables DNAT, which
+        # pushes every hop through conntrack; raise the table cap only when
+        # conntrack is actually loaded on this machine.
+        current_conntrack=$(get_sysctl net.netfilter.nf_conntrack_max)
+        conntrack_max=$(clamp $((MEM_MB * 64)) 65536 1048576)
+        if [[ -n $current_conntrack ]] && ! decimal_ge "$current_conntrack" "$conntrack_max"; then
+            add_setting net.netfilter.nf_conntrack_max "$conntrack_max" \
+                "端口跳跃 DNAT 场景的连接跟踪表上限（只增不减）"
+        fi
+    fi
 }
 
 filter_supported_settings() {
@@ -992,6 +1203,7 @@ render_sysctl_config() {
     {
         printf '# Generated by %s v%s\n' "$PROGRAM_NAME" "$SCRIPT_VERSION"
         printf '# Workload: AnyTLS, VLESS/WS/TLS/CDN, Xray/sing-box, Hysteria/QUIC\n'
+        printf '# Primary protocol profile: %s\n' "$PROTOCOL"
         printf '# Inputs: local=%s Mbps, server=%s Mbps, effective=%s Mbps\n' "$LOCAL_MBPS" "$SERVER_MBPS" "$EFFECTIVE_MBPS"
         printf '# RTT input: %s ms (%s); BDP=%s bytes; buffer=%s MiB\n' "$RTT_MS" "$RTT_SOURCE" "$BDP_BYTES" "$BUFFER_MIB"
         printf '# This file may be removed safely, then run: sysctl --system\n\n'
@@ -1011,11 +1223,17 @@ print_plan() {
     printf '虚拟化           : %s\n' "$VIRT_TYPE"
     printf '主网卡           : %s\n' "${PRIMARY_IFACE:-未检测到}"
     printf 'IP 模式          : %s\n' "$IP_MODE"
+    printf '主力协议         : %s\n' "$PROTOCOL_LABEL"
     printf '本地/VPS 带宽    : %s / %s Mbps（有效 %s Mbps）\n' "$LOCAL_MBPS" "$SERVER_MBPS" "$EFFECTIVE_MBPS"
-    printf '本机实测 RTT     : %s ms\n' "$RTT_MS"
+    printf '实测 RTT         : %s ms（%s）\n' "$RTT_MS" "$RTT_SOURCE"
     printf 'BDP              : %s MiB\n' "$bdp_mib"
     printf 'TCP/UDP 最大缓冲 : %s MiB（RAM 安全上限 %s MiB）\n' "$BUFFER_MIB" "$BUFFER_CAP_MIB"
     printf '拥塞控制 / 队列  : %s + %s\n' "$SELECTED_CC" "$SELECTED_QDISC"
+    if ((INITCWND > 0)); then
+        printf '初始拥塞窗口     : initcwnd/initrwnd %s（即时修改默认路由并写入 systemd 持久化）\n' "$INITCWND"
+    else
+        printf '初始拥塞窗口     : 保持内核默认（10）\n'
+    fi
     printf '当前 BBR 识别     : %s\n' "$CURRENT_BBR_GENERATION"
     printf 'ECN              : 主动协商，异常路径自动回退\n'
     printf 'FD 上限          : %s（PAM、systemd、代理 unit 和运行中进程）\n' "$NOFILE_LIMIT"
@@ -1048,6 +1266,12 @@ print_plan() {
         fi
     fi
     ((BUFFER_WAS_CAPPED == 1)) && warn "所需窗口超过内存安全上限，已自动裁剪；极端高 BDP 单流可能受内存限制。"
+    if ((${#PROFILE_NOTES[@]})); then
+        local profile_note
+        for profile_note in "${PROFILE_NOTES[@]}"; do
+            printf '协议要点         : %s\n' "$profile_note"
+        done
+    fi
     printf '\n内核建议         : %s\n' "$KERNEL_ADVICE"
     [[ -n $KERNEL_ADVICE_DETAIL ]] && printf '建议说明         : %s\n' "$KERNEL_ADVICE_DETAIL"
     if ((OFFER_BBRV3_INSTALL == 1)); then
@@ -1096,6 +1320,7 @@ create_backup() {
     backup_path "$backup_dir" "$LIMITS_CONF" || return 1
     backup_path "$backup_dir" "$SYSTEMD_CONF" || return 1
     backup_path "$backup_dir" "$MODULES_CONF" || return 1
+    backup_path "$backup_dir" "$INITCWND_UNIT" || return 1
     for path in "${PROXY_DROPIN_PATHS[@]}"; do
         backup_path "$backup_dir" "$path" || return 1
     done
@@ -1117,6 +1342,10 @@ create_backup() {
         printf 'ROOT_QDISC=%s\n' "$root_qdisc"
         printf 'QDISC_TOUCHED=0\n'
         printf 'QDISC_LEAVES_TOUCHED=0\n'
+        printf 'ROUTE4_TOUCHED=0\n'
+        printf 'ROUTE6_TOUCHED=0\n'
+        printf 'ROUTE4_ORIG=%s\n' "$(current_default_route 4 || true)"
+        printf 'ROUTE6_ORIG=%s\n' "$(current_default_route 6 || true)"
     } >"$backup_dir/runtime.state" || return 1
 
     mkdir -p -- "$STATE_DIR" || return 1
@@ -1127,7 +1356,7 @@ create_backup() {
 
 allowed_managed_path() {
     case $1 in
-        "$SYSCTL_CONF" | "$LIMITS_CONF" | "$SYSTEMD_CONF" | "$MODULES_CONF") return 0 ;;
+        "$SYSCTL_CONF" | "$LIMITS_CONF" | "$SYSTEMD_CONF" | "$MODULES_CONF" | "$INITCWND_UNIT") return 0 ;;
         /etc/systemd/system/*.service.d/"$PROXY_DROPIN_NAME")
             local unit_dir=${1#/etc/systemd/system/}
             unit_dir=${unit_dir%/$PROXY_DROPIN_NAME}
@@ -1173,6 +1402,7 @@ restore_qdisc_leaf_from_backup() {
 restore_backup_internal() {
     local backup_dir=$1 status path relative value key failures=0
     local iface="" root_qdisc="" qdisc_touched=0 qdisc_leaves_touched=0 parent
+    local route4_touched=0 route6_touched=0 route4_orig="" route6_orig=""
     [[ $backup_dir == "$BACKUP_ROOT"/* && -f $backup_dir/files.manifest ]] || {
         error "备份目录无效: $backup_dir"
         return 1
@@ -1217,6 +1447,10 @@ restore_backup_internal() {
                 ROOT_QDISC) root_qdisc=$value ;;
                 QDISC_TOUCHED) qdisc_touched=$value ;;
                 QDISC_LEAVES_TOUCHED) qdisc_leaves_touched=$value ;;
+                ROUTE4_TOUCHED) route4_touched=$value ;;
+                ROUTE6_TOUCHED) route6_touched=$value ;;
+                ROUTE4_ORIG) route4_orig=$value ;;
+                ROUTE6_ORIG) route6_orig=$value ;;
             esac
         done <"$backup_dir/runtime.state"
     fi
@@ -1239,6 +1473,22 @@ restore_backup_internal() {
             restore_qdisc_leaf_from_backup "$iface" "$parent" "$backup_dir/qdisc.txt" \
                 || { warn "未能恢复 $iface 的叶子队列 $parent"; failures=$((failures + 1)); }
         done <"$backup_dir/qdisc.touched"
+    fi
+
+    if [[ $route4_touched == 1 && $route4_orig == default* ]]; then
+        # shellcheck disable=SC2086
+        ip -4 route change $route4_orig >/dev/null 2>&1 \
+            || { warn "未能恢复 IPv4 默认路由的 initcwnd 参数"; failures=$((failures + 1)); }
+    fi
+    if [[ $route6_touched == 1 && $route6_orig == default* ]]; then
+        # shellcheck disable=SC2086
+        ip -6 route change $route6_orig >/dev/null 2>&1 \
+            || { warn "未能恢复 IPv6 默认路由的 initcwnd 参数"; failures=$((failures + 1)); }
+    fi
+    if [[ ! -e $INITCWND_UNIT ]] && command -v systemctl >/dev/null 2>&1 \
+        && [[ -d /run/systemd/system ]]; then
+        systemctl disable "$(basename "$INITCWND_UNIT")" >/dev/null 2>&1 || true
+        rm -f -- "/etc/systemd/system/multi-user.target.wants/$(basename "$INITCWND_UNIT")"
     fi
 
     if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
@@ -1811,6 +2061,73 @@ apply_live_qdisc() {
     esac
 }
 
+write_initcwnd_unit() {
+    local fams
+    case $IP_MODE in
+        4) fams="-4" ;;
+        6) fams="-6" ;;
+        *) fams="-4 -6" ;;
+    esac
+    # In the systemd unit "$$" collapses to a literal "$" for /bin/sh. The
+    # route spec is re-read on every boot, so a gateway that changed since
+    # this file was written is never clobbered with stale data.
+    write_atomic_file "$INITCWND_UNIT" 0644 <<EOF || return 1
+# Generated by $PROGRAM_NAME v$SCRIPT_VERSION
+[Unit]
+Description=proxy-net-tune: raise initcwnd/initrwnd on default routes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for f in $fams; do [ "\$\$(ip \$\$f route show default 2>/dev/null | grep -c .)" = 1 ] || continue; r=\$\$(ip \$\$f route show default | head -n1 | sed -E "s/ +/ /g; s/ (initcwnd|initrwnd) [0-9]+//g; s/ expires [0-9]+sec//g; s/ linkdown//g"); [ -n "\$\$r" ] && ip \$\$f route change \$\$r initcwnd $INITCWND initrwnd $INITCWND || :; done'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable "$(basename "$INITCWND_UNIT")" >/dev/null 2>&1 || return 1
+    fi
+    return 0
+}
+
+apply_initcwnd() {
+    ((INITCWND > 0)) || return 0
+    local state_file="$ACTIVE_BACKUP/runtime.state" fam base applied=0 skipped=0
+    for fam in 4 6; do
+        case $IP_MODE in
+            4) [[ $fam == 4 ]] || continue ;;
+            6) [[ $fam == 6 ]] || continue ;;
+        esac
+        if ! base=$(current_default_route "$fam"); then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        [[ -n $base ]] || { skipped=$((skipped + 1)); continue; }
+        if ! sed -i "s/^ROUTE${fam}_TOUCHED=.*/ROUTE${fam}_TOUCHED=1/" "$state_file"; then
+            warn "无法记录 IPv$fam 路由回滚状态，跳过该协议族的 initcwnd。"
+            continue
+        fi
+        # shellcheck disable=SC2086
+        if ip "-$fam" route change $base initcwnd "$INITCWND" initrwnd "$INITCWND" >/dev/null 2>&1; then
+            applied=$((applied + 1))
+        else
+            sed -i "s/^ROUTE${fam}_TOUCHED=.*/ROUTE${fam}_TOUCHED=0/" "$state_file" || true
+            warn "IPv$fam 默认路由不接受 initcwnd 修改，已保持原样。"
+        fi
+    done
+    if ((applied > 0)); then
+        info "已把 $applied 个默认路由的 initcwnd/initrwnd 提升到 $INITCWND"
+        write_initcwnd_unit \
+            || warn "initcwnd 已即时生效，但持久化服务写入/启用失败；重启后需重跑脚本。"
+    elif ((skipped > 0)); then
+        warn "没有找到可安全修改的默认路由（不存在或为多路径），initcwnd 未生效。"
+    fi
+    return 0
+}
+
 raise_live_proxy_limits() {
     command -v prlimit >/dev/null 2>&1 || {
         warn "未找到 prlimit；FD 新上限将在代理服务下次重启时生效。"
@@ -1903,6 +2220,7 @@ apply_configuration() {
         rollback_on_failure "qdisc 应用前的回滚状态记录失败"
         return 1
     fi
+    apply_initcwnd
     raise_live_proxy_limits
     APPLYING=0
     return 0
@@ -1936,6 +2254,11 @@ validate_result() {
         printf '  tc qdisc (%s)：\n' "$PRIMARY_IFACE"
         qdisc_output=$(tc qdisc show dev "$PRIMARY_IFACE" 2>/dev/null || true)
         sed 's/^/    /' <<<"$qdisc_output"
+    fi
+    if ((INITCWND > 0)); then
+        printf '  默认路由（应含 initcwnd %s）：\n' "$INITCWND"
+        { ip -4 route show default 2>/dev/null; ip -6 route show default 2>/dev/null; } \
+            | sed 's/^/    /'
     fi
     detect_bbr_generation
     printf '  %-42s %s\n' "BBR generation" "$CURRENT_BBR_GENERATION"
@@ -1974,10 +2297,16 @@ show_status() {
     for key in net.ipv4.tcp_available_congestion_control net.ipv4.tcp_congestion_control \
         net.core.default_qdisc net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem \
         net.ipv4.tcp_wmem net.ipv4.tcp_fastopen net.ipv4.tcp_ecn net.ipv4.tcp_ecn_fallback \
-        net.ipv4.tcp_mem net.ipv4.tcp_tw_reuse \
+        net.ipv4.tcp_mem net.ipv4.tcp_tw_reuse net.ipv4.tcp_fin_timeout \
+        net.ipv4.tcp_no_metrics_save net.ipv4.tcp_keepalive_time net.core.optmem_max \
+        net.ipv4.udp_mem net.netfilter.nf_conntrack_max \
         net.ipv4.ip_local_port_range net.ipv4.ip_local_reserved_ports fs.file-max fs.nr_open; do
         sysctl_exists "$key" && printf '%-43s %s\n' "$key" "$(get_sysctl "$key")"
     done
+    printf '\n默认路由（可检查 initcwnd 是否生效）：\n'
+    { ip -4 route show default 2>/dev/null; ip -6 route show default 2>/dev/null; } \
+        | sed 's/^/  /'
+    [[ -f $INITCWND_UNIT ]] && printf 'initcwnd 持久化  : %s\n' "$INITCWND_UNIT"
     if ((${#PROXY_UNITS[@]})); then
         printf '\n代理 systemd 服务 FD：\n'
         for unit in "${PROXY_UNITS[@]}"; do
@@ -2078,6 +2407,41 @@ run_self_test() {
         failures=$((failures + 1))
     fi
 
+    PROTOCOL="hysteria"
+    MEM_MB=2048 CPU_CORES=2 LOCAL_MBPS=500 SERVER_MBPS=500 RTT_MS=20
+    calculate_tuning
+    apply_protocol_profile
+    if ((BUFFER_MIB == 16)); then
+        printf '  PASS  Hysteria 档把过小的 UDP 缓冲抬到 16 MiB 下限\n'
+    else
+        printf '  FAIL  Hysteria 缓冲下限: buffer=%s\n' "$BUFFER_MIB"
+        failures=$((failures + 1))
+    fi
+
+    PROTOCOL="vless-cdn"
+    MEM_MB=2048 CPU_CORES=2 LOCAL_MBPS=1000 SERVER_MBPS=1000 RTT_MS=10
+    calculate_tuning
+    apply_protocol_profile
+    if ((SOMAXCONN == 8192 && SYN_BACKLOG == 16384 && KEEPALIVE_TIME == 600)); then
+        printf '  PASS  CDN 档加倍 accept/SYN 队列并缩短保活\n'
+    else
+        printf '  FAIL  CDN 档: somaxconn=%s syn=%s keepalive=%s\n' \
+            "$SOMAXCONN" "$SYN_BACKLOG" "$KEEPALIVE_TIME"
+        failures=$((failures + 1))
+    fi
+
+    if normalize_protocol "HY2" && [[ $PROTOCOL == "hysteria" ]] \
+        && normalize_protocol "4" && [[ $PROTOCOL == "vless-cdn" ]] \
+        && normalize_protocol "0" && [[ $PROTOCOL == "general" ]] \
+        && ! normalize_protocol "quic-madness"; then
+        printf '  PASS  协议名/编号归一化与非法值拒绝\n'
+    else
+        printf '  FAIL  协议名归一化\n'
+        failures=$((failures + 1))
+    fi
+    PROTOCOL="general"
+    apply_protocol_profile
+
     ((failures == 0)) || return 1
     info "全部计算测试通过。"
 }
@@ -2114,11 +2478,14 @@ main_apply() {
         *) die "IP 模式必须是 4、6 或 dual" ;;
     esac
 
+    select_protocol
     detect_system
     discover_proxy_units
     configure_hysteria_port_hopping
     set_rtt_input
     calculate_tuning
+    apply_protocol_profile
+    configure_initcwnd
     select_algorithms
     detect_bbr_generation
     build_kernel_advice
