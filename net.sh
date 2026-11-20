@@ -22,7 +22,7 @@
 set -u
 set -o pipefail
 
-readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_VERSION="1.4.1"
 readonly PROGRAM_NAME="proxy-net-tune"
 readonly SYSCTL_CONF="/etc/sysctl.d/99-zz-proxy-net-tune.conf"
 readonly LIMITS_CONF="/etc/security/limits.d/99-zz-proxy-net-tune.conf"
@@ -1145,7 +1145,7 @@ prepare_settings() {
 
     if [[ $PROTOCOL == "hysteria" ]]; then
         local udp_pages udp_min_pages udp_pressure_pages current_udp_mem current_udp_max
-        local conntrack_max current_conntrack
+        local conntrack_max current_conntrack current_budget current_budget_usecs
         udp_pages=$(clamp $((MEM_MB * 64)) 24576 262144)
         udp_min_pages=$((udp_pages / 2))
         udp_pressure_pages=$((udp_pages * 3 / 4))
@@ -1155,8 +1155,17 @@ prepare_settings() {
             add_setting net.ipv4.udp_mem "$udp_min_pages $udp_pressure_pages $udp_pages" \
                 "UDP 全局内存页上限，防止 Hysteria 大流量时整体丢包（只增不减）"
         fi
-        add_setting net.core.netdev_budget 600 "软中断每轮多处理一些 UDP 包"
-        add_setting net.core.netdev_budget_usecs 4000 "软中断单轮时间预算"
+        current_budget=$(get_sysctl net.core.netdev_budget)
+        if ! is_uint "$current_budget" || ((current_budget < 600)); then
+            add_setting net.core.netdev_budget 600 "软中断每轮多处理一些 UDP 包（只增不减）"
+        fi
+        # The kernel floor AND default are 2 ticks (2*USEC_PER_SEC/HZ): 8000 us on
+        # Debian's HZ=250, so writing 4000 there fails with EINVAL. Only raise it
+        # on high-HZ kernels whose default is below 4000 us.
+        current_budget_usecs=$(get_sysctl net.core.netdev_budget_usecs)
+        if is_uint "$current_budget_usecs" && ((current_budget_usecs < 4000)); then
+            add_setting net.core.netdev_budget_usecs 4000 "软中断单轮时间预算（只增不减）"
+        fi
 
         # Port hopping is usually implemented with nft/iptables DNAT, which
         # pushes every hop through conntrack; raise the table cap only when
@@ -2164,26 +2173,56 @@ raise_live_proxy_limits() {
     fi
 }
 
+is_core_sysctl() {
+    case $1 in
+        net.ipv4.tcp_congestion_control | net.core.default_qdisc | net.core.rmem_max \
+            | net.core.wmem_max | net.ipv4.tcp_rmem | net.ipv4.tcp_wmem) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Core keys must apply or the whole run rolls back. Auxiliary keys that the
+# running kernel rejects (out-of-range value etc.) are skipped and pruned from
+# SYSCTL_* so the persistent file never carries a value that fails at boot.
 apply_runtime_sysctls() {
-    local i key value failures=0
+    local i key value reason failures=0
+    local -a keys=() values=() notes=()
     for ((i = 0; i < ${#SYSCTL_KEYS[@]}; i++)); do
         key=${SYSCTL_KEYS[$i]}
         value=${SYSCTL_VALUES[$i]}
         if ((FUTURE_BBR_ONLY == 1)) && [[ $key == "net.ipv4.tcp_congestion_control" ]]; then
+            :
+        elif ! reason=$(sysctl -q -w "$key=$value" 2>&1 >/dev/null); then
+            reason=$(normalize_user_input "${reason##*: }")
+            if is_core_sysctl "$key"; then
+                error "无法应用 $key = $value（${reason:-未知原因}）"
+                failures=$((failures + 1))
+            else
+                warn "内核拒绝 $key = $value（${reason:-未知原因}），已跳过且不写入持久配置。"
+                SKIPPED_SETTINGS+=("$key（内核拒绝 $value）")
+            fi
             continue
         fi
-        if ! sysctl -q -w "$key=$value" >/dev/null 2>&1; then
-            error "无法应用 $key = $value"
-            failures=$((failures + 1))
-        fi
+        keys+=("$key")
+        values+=("$value")
+        notes+=("${SYSCTL_NOTES[$i]}")
     done
-    ((failures == 0))
+    ((failures == 0)) || return 1
+    SYSCTL_KEYS=("${keys[@]}")
+    SYSCTL_VALUES=("${values[@]}")
+    SYSCTL_NOTES=("${notes[@]}")
 }
 
 apply_configuration() {
     local temp
     [[ -n $ACTIVE_BACKUP ]] || create_backup || die "无法创建备份"
     APPLYING=1
+
+    # Apply at runtime first, so the persistent file only holds accepted values.
+    if ! apply_runtime_sysctls; then
+        rollback_on_failure "sysctl 应用失败"
+        return 1
+    fi
 
     temp=$(make_temp) || {
         rollback_on_failure "无法创建临时文件"
@@ -2201,11 +2240,6 @@ apply_configuration() {
         return 1
     fi
     rm -f -- "$temp"
-
-    if ! apply_runtime_sysctls; then
-        rollback_on_failure "sysctl 应用失败"
-        return 1
-    fi
 
     if ! write_supporting_configs; then
         rollback_on_failure "写入 FD/systemd 配置失败"
